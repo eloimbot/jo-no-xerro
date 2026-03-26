@@ -31,42 +31,57 @@ function App() {
     setUser(null);
   };
 
+  if (!token) {
+    return (
+      <Router>
+        <Auth onLogin={handleLogin} />
+      </Router>
+    );
+  }
+
   return (
     <Router>
-      {!token ? (
-        <Auth onLogin={handleLogin} />
-      ) : (
-        <div className="app-container">
-          <nav className="glass-nav">
-            <div className="nav-brand">jo no xerro</div>
-            <div className="nav-links">
-              <Link to="/" className="nav-link">Feed</Link>
-              <Link to="/chat" className="nav-link">Chat</Link>
-              <Link to="/upload" className="nav-link">Upload</Link>
-              <Link to={`/profile/${user.username}`} className="nav-link">Profile</Link>
-              {user?.role === 'admin' && (
-                <Link to="/admin" className="nav-link">Admin</Link>
-              )}
-              <span className="nav-user">{user.username}</span>
-              <button onClick={handleLogout} className="text-btn">Logout</button>
-            </div>
-          </nav>
-          <main className="main-content">
-            <Routes>
-              <Route path="/" element={<Feed />} />
-              <Route path="/chat" element={<Chat />} />
-              <Route path="/upload" element={<Upload token={token} />} />
-              <Route path="/video/:id" element={<VideoPlayer token={token} currentUser={user} />} />
-              <Route path="/profile/:username" element={<Profile />} />
-              <Route path="/admin" element={user?.role === 'admin' ? <Admin token={token} /> : <Navigate to="/" />} />
-              <Route path="*" element={<Navigate to="/" />} />
-            </Routes>
-          </main>
-        </div>
-      )}
+      <div className="app-container">
+        {/* Desktop Header */}
+        <nav className="desktop-nav glass-panel">
+          <div className="nav-brand">jo no xerro</div>
+          <div className="nav-links">
+            <Link to="/" className="nav-link">Descubrir</Link>
+            <Link to="/chat" className="nav-link">Chat</Link>
+            <Link to="/upload" className="nav-link">Subir</Link>
+            <Link to={`/profile/${user.username}`} className="nav-link">Perfil</Link>
+            {user?.role === 'admin' && <Link to="/admin" className="nav-link">Admin</Link>}
+            <button onClick={handleLogout} className="logout-btn">Cerrar Sesión</button>
+          </div>
+        </nav>
+
+        {/* Mobile Bottom Nav */}
+        <nav className="mobile-nav glass-panel-dark">
+          <Link to="/" className="mobile-nav-link">🏠</Link>
+          <Link to="/chat" className="mobile-nav-link">💬</Link>
+          <Link to="/upload" className="mobile-nav-link action">➕</Link>
+          <Link to={`/profile/${user.username}`} className="mobile-nav-link">👤</Link>
+          {user?.role === 'admin' && <Link to="/admin" className="mobile-nav-link">⚙️</Link>}
+          <button onClick={handleLogout} className="mobile-nav-link">🚪</button>
+        </nav>
+
+
+        <main className="main-content">
+          <Routes>
+            <Route path="/" element={<Feed />} />
+            <Route path="/chat" element={<Chat />} />
+            <Route path="/upload" element={<Upload token={token} />} />
+            <Route path="/video/:id" element={<VideoPlayer token={token} currentUser={user} />} />
+            <Route path="/profile/:username" element={<Profile />} />
+            <Route path="/admin" element={user?.role === 'admin' ? <Admin token={token} /> : <Navigate to="/" />} />
+            <Route path="*" element={<Navigate to="/" />} />
+          </Routes>
+        </main>
+      </div>
     </Router>
   );
 }
 
 export default App;
+
 

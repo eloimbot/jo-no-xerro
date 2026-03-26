@@ -4,7 +4,7 @@ import axios from 'axios';
 import './VideoPlayer.css';
 
 const API_URL = '/api';
-const STREAM_URL = '/api/stream';
+const MEDIA_URL = '/api/media';
 
 function VideoPlayer({ token, currentUser }) {
   const { id } = useParams();
@@ -64,7 +64,7 @@ function VideoPlayer({ token, currentUser }) {
     }
   };
 
-  const formatDate = (dateStr) => new Date(dateStr).toLocaleDateString('en-US', {
+  const formatDate = (dateStr) => new Date(dateStr).toLocaleDateString('es-ES', {
     year: 'numeric', month: 'long', day: 'numeric'
   });
 
@@ -75,7 +75,7 @@ function VideoPlayer({ token, currentUser }) {
   };
 
   if (loading) return <div className="player-loading"><div className="spinner"></div></div>;
-  if (!video) return <div className="player-loading"><h3>Video not found</h3></div>;
+  if (!video) return <div className="player-loading"><h3>Video no encontrado</h3></div>;
 
   const isOwner = currentUser?.id === video.user_id;
   const isAdmin = currentUser?.role === 'admin';
@@ -85,12 +85,13 @@ function VideoPlayer({ token, currentUser }) {
       <div className="player-main">
         <div className="video-wrapper">
           <video
-            src={`${STREAM_URL}/${video.filename}`}
+            src={`${MEDIA_URL}/${video.filename}`}
             controls
             autoPlay
             className="main-video"
           />
         </div>
+
 
         <div className="video-details glass-panel">
           <h1 className="video-detail-title">{video.title}</h1>

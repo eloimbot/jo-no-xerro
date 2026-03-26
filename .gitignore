@@ -1,0 +1,10 @@
+node_modules/
+.env
+server/chat.db
+server/chat.db-shm
+server/chat.db-wal
+server/uploads/
+server/stickers/
+client/dist/
+.DS_Store
+*.log

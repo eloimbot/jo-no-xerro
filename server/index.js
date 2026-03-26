@@ -25,33 +25,26 @@ const MAX_FILE_SIZE = 2 * 1024 * 1024 * 1024; // 2GB
 
 app.use(cors());
 app.use(express.json());
-app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
-// Ensure upload dir exists
+// Ensure upload dirs exist
 const uploadDir = path.join(__dirname, 'uploads');
+const stickersDir = path.join(__dirname, 'uploads', 'stickers');
 if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir);
+if (!fs.existsSync(stickersDir)) fs.mkdirSync(stickersDir, { recursive: true });
 
-// Multer setup for large video uploads
+// Multer setup
 const storage = multer.diskStorage({
-    destination: (req, file, cb) => cb(null, uploadDir),
+    destination: (req, file, cb) => {
+        if (file.fieldname === 'sticker') cb(null, stickersDir);
+        else cb(null, uploadDir);
+    },
     filename: (req, file, cb) => {
         const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
         const ext = path.extname(file.originalname);
         cb(null, uniqueSuffix + ext);
     }
 });
-
-const upload = multer({
-    storage,
-    limits: { fileSize: MAX_FILE_SIZE },
-    fileFilter: (req, file, cb) => {
-        if (file.mimetype.startsWith('video/')) {
-            cb(null, true);
-        } else {
-            cb(new Error('Only video files are allowed'), false);
-        }
-    }
-});
+const upload = multer({ storage, limits: { fileSize: MAX_FILE_SIZE } });
 
 // === AUTH MIDDLEWARE ===
 
@@ -101,241 +94,367 @@ app.post('/api/login', (req, res) => {
     });
 });
 
-app.get('/api/users', (req, res) => {
-    db.all('SELECT id, username, role FROM users', [], (err, rows) => {
+// === CONTACTS API ===
+
+app.get('/api/users/:username/videos', (req, res) => {
+    db.all(`SELECT v.*, u.username, 
+            (SELECT COUNT(*) FROM video_likes WHERE video_id = v.id) as like_count
+            FROM videos v 
+            JOIN users u ON v.user_id = u.id 
+            WHERE u.username = ?
+            ORDER BY v.created_at DESC`, [req.params.username], (err, rows) => {
         if (err) return res.status(500).json({ error: err.message });
         res.json(rows);
     });
 });
 
+app.get('/api/users/:username', authenticate, (req, res) => {
+    const { username } = req.params;
+    db.get('SELECT * FROM users WHERE username = ?', [username], (err, user) => {
+        if (err) {
+            console.error('DATABASE ERROR (Profile):', err.message);
+            return res.status(500).json({ error: err.message });
+        }
+        if (!user) return res.status(404).json({ error: 'User not found' });
+        
+        // Remove sensitive info and return
+        const { password, ...safeUser } = user;
+        res.json(safeUser);
+    });
+});
+
+
+
+
+app.get('/api/users', authenticate, requireAdmin, (req, res) => {
+    db.all('SELECT * FROM users', [], (err, rows) => {
+        if (err) {
+            console.error('DATABASE ERROR (Admin List):', err.message);
+            return res.status(500).json({ error: err.message });
+        }
+        // Remove sensitive info
+        const safeRows = rows.map(u => {
+            const { password, ...rest } = u;
+            return rest;
+        });
+        res.json(safeRows);
+    });
+});
+
+
 app.delete('/api/users/:id', authenticate, requireAdmin, (req, res) => {
-    const { id } = req.params;
-    if (parseInt(id) === req.user.id) return res.status(400).json({ error: 'Cannot delete yourself' });
-    db.run('DELETE FROM users WHERE id = ? AND role != ?', [id, 'admin'], function(err) {
+    db.run('DELETE FROM users WHERE id = ?', [req.params.id], function(err) {
         if (err) return res.status(500).json({ error: err.message });
-        if (this.changes === 0) return res.status(404).json({ error: 'User not found or is admin' });
         res.json({ message: 'User deleted' });
     });
 });
 
-// === VIDEO FEED API ===
+app.get('/api/messages/all', authenticate, requireAdmin, (req, res) => {
+    db.all(`SELECT m.*, u1.username as sender_username, 
+            CASE WHEN m.chat_type = 'direct' THEN u2.username ELSE g.name END as receiver_username
+            FROM messages m
+            JOIN users u1 ON m.sender_id = u1.id
+            LEFT JOIN users u2 ON (m.chat_type = 'direct' AND m.receiver_id = u2.id)
+            LEFT JOIN groups g ON (m.chat_type = 'group' AND m.receiver_id = g.id)
+            ORDER BY m.timestamp DESC LIMIT 100`, [], (err, rows) => {
+        if (err) return res.status(500).json({ error: err.message });
+        res.json(rows);
+    });
+});
 
-// Get paginated feed (all videos, newest first)
+app.get('/api/admin/videos', authenticate, requireAdmin, (req, res) => {
+    db.all(`SELECT v.*, u.username FROM videos v JOIN users u ON v.user_id = u.id ORDER BY v.created_at DESC`, [], (err, rows) => {
+        if (err) return res.status(500).json({ error: err.message });
+        res.json(rows);
+    });
+});
+
+app.get('/api/admin/stats', authenticate, requireAdmin, (req, res) => {
+    const stats = {};
+    db.get('SELECT COUNT(*) as totalUsers FROM users', (err, row) => {
+        stats.totalUsers = row.totalUsers;
+        db.get('SELECT COUNT(*) as totalVideos, SUM(views) as totalViews FROM videos', (err, row) => {
+            stats.totalVideos = row.totalVideos || 0;
+            stats.totalViews = row.totalViews || 0;
+            db.get('SELECT COUNT(*) as totalLikes FROM video_likes', (err, row) => {
+                stats.totalLikes = row.totalLikes || 0;
+                res.json(stats);
+            });
+        });
+    });
+});
+
+// === SOCIAL NETWORK API ===
+
 app.get('/api/feed', (req, res) => {
     const page = parseInt(req.query.page) || 1;
     const limit = parseInt(req.query.limit) || 12;
     const offset = (page - 1) * limit;
 
-    db.get('SELECT COUNT(*) as total FROM videos', [], (err, countRow) => {
-        if (err) return res.status(500).json({ error: err.message });
-
-        db.all(`SELECT v.*, u.username,
-                (SELECT COUNT(*) FROM likes WHERE video_id = v.id) as like_count
-                FROM videos v
-                JOIN users u ON v.user_id = u.id
-                ORDER BY v.created_at DESC
-                LIMIT ? OFFSET ?`, [limit, offset], (err, rows) => {
+    db.get('SELECT COUNT(*) as count FROM videos', (err, row) => {
+        const total = row.count;
+        db.all(`SELECT v.*, u.username, 
+                (SELECT COUNT(*) FROM video_likes WHERE video_id = v.id) as like_count
+                FROM videos v 
+                JOIN users u ON v.user_id = u.id 
+                ORDER BY v.created_at DESC LIMIT ? OFFSET ?`, [limit, offset], (err, rows) => {
             if (err) return res.status(500).json({ error: err.message });
-            res.json({
+            res.json({ 
                 videos: rows,
-                total: countRow.total,
-                page,
-                totalPages: Math.ceil(countRow.total / limit)
+                totalPages: Math.ceil(total / limit),
+                currentPage: page
             });
         });
     });
 });
 
-// Get single video metadata
-app.get('/api/videos/:id', (req, res) => {
-    const { id } = req.params;
-    db.get(`SELECT v.*, u.username,
-            (SELECT COUNT(*) FROM likes WHERE video_id = v.id) as like_count
-            FROM videos v
-            JOIN users u ON v.user_id = u.id
-            WHERE v.id = ?`, [id], (err, video) => {
-        if (err) return res.status(500).json({ error: err.message });
-        if (!video) return res.status(404).json({ error: 'Video not found' });
 
-        // Increment view count
-        db.run('UPDATE videos SET views = views + 1 WHERE id = ?', [id]);
+app.post('/api/videos/upload', authenticate, upload.single('video'), (req, res) => {
+    const { title, description } = req.body;
+    if (!req.file || !title) return res.status(400).json({ error: 'Title and video file required' });
+    
+    db.run('INSERT INTO videos (user_id, filename, title, description) VALUES (?, ?, ?, ?)',
+        [req.user.id, req.file.filename, title, description], function(err) {
+        if (err) return res.status(500).json({ error: err.message });
+        res.status(201).json({ id: this.lastID, filename: req.file.filename });
+    });
+});
+
+app.get('/api/videos/:id', (req, res) => {
+    db.get(`SELECT v.*, u.username, 
+            (SELECT COUNT(*) FROM video_likes WHERE video_id = v.id) as like_count
+            FROM videos v 
+            JOIN users u ON v.user_id = u.id 
+            WHERE v.id = ?`, [req.params.id], (err, video) => {
+        if (err || !video) return res.status(404).json({ error: 'Video not found' });
+        
+        // Mark view
+        db.run('UPDATE videos SET views = views + 1 WHERE id = ?', [req.params.id]);
         res.json(video);
     });
 });
 
-// Upload a video (authenticated)
-app.post('/api/videos/upload', authenticate, upload.single('video'), (req, res) => {
-    if (!req.file) return res.status(400).json({ error: 'No video file uploaded' });
-    const { title, description } = req.body;
-    if (!title || !title.trim()) return res.status(400).json({ error: 'Title is required' });
-
-    db.run(`INSERT INTO videos (user_id, title, description, filename, original_name, mimetype, size)
-            VALUES (?, ?, ?, ?, ?, ?, ?)`,
-        [req.user.id, title.trim(), description?.trim() || '', req.file.filename, req.file.originalname, req.file.mimetype, req.file.size],
-        function(err) {
-            if (err) return res.status(500).json({ error: err.message });
-            res.status(201).json({ id: this.lastID, message: 'Video uploaded successfully' });
-        });
-});
-
-// Delete a video (owner or admin)
-app.delete('/api/videos/:id', authenticate, (req, res) => {
-    const { id } = req.params;
-    db.get('SELECT * FROM videos WHERE id = ?', [id], (err, video) => {
-        if (err) return res.status(500).json({ error: err.message });
-        if (!video) return res.status(404).json({ error: 'Video not found' });
-        if (video.user_id !== req.user.id && req.user.role !== 'admin') {
-            return res.status(403).json({ error: 'Not authorized' });
-        }
-        // Delete file from disk
-        const filePath = path.join(uploadDir, video.filename);
-        if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
-
-        db.run('DELETE FROM videos WHERE id = ?', [id], function(err) {
-            if (err) return res.status(500).json({ error: err.message });
-            res.json({ message: 'Video deleted' });
-        });
-    });
-});
-
-// Toggle like on a video
 app.post('/api/videos/:id/like', authenticate, (req, res) => {
-    const videoId = req.params.id;
-    const userId = req.user.id;
-
-    db.get('SELECT * FROM likes WHERE user_id = ? AND video_id = ?', [userId, videoId], (err, like) => {
-        if (err) return res.status(500).json({ error: err.message });
-        if (like) {
-            db.run('DELETE FROM likes WHERE user_id = ? AND video_id = ?', [userId, videoId], (err) => {
-                if (err) return res.status(500).json({ error: err.message });
+    db.run('INSERT INTO video_likes (user_id, video_id) VALUES (?, ?)',
+        [req.user.id, req.params.id], function(err) {
+        if (err) {
+            // Un-like if already liked
+            db.run('DELETE FROM video_likes WHERE user_id = ? AND video_id = ?', [req.user.id, req.params.id], () => {
                 res.json({ liked: false });
             });
         } else {
-            db.run('INSERT INTO likes (user_id, video_id) VALUES (?, ?)', [userId, videoId], (err) => {
-                if (err) return res.status(500).json({ error: err.message });
-                res.json({ liked: true });
-            });
+            res.json({ liked: true });
         }
     });
 });
 
-// Check if user liked a video
-app.get('/api/videos/:id/liked', authenticate, (req, res) => {
-    db.get('SELECT * FROM likes WHERE user_id = ? AND video_id = ?', [req.user.id, req.params.id], (err, like) => {
-        if (err) return res.status(500).json({ error: err.message });
-        res.json({ liked: !!like });
-    });
-});
-
-// Get videos by a specific user
-app.get('/api/users/:username/videos', (req, res) => {
-    const { username } = req.params;
-    db.all(`SELECT v.*, u.username,
-            (SELECT COUNT(*) FROM likes WHERE video_id = v.id) as like_count
-            FROM videos v
-            JOIN users u ON v.user_id = u.id
-            WHERE u.username = ?
-            ORDER BY v.created_at DESC`, [username], (err, rows) => {
+app.get('/api/contacts', authenticate, (req, res) => {
+    db.all(`SELECT u.id, u.username, u.avatar_url, c.status FROM contacts c
+            JOIN users u ON (c.user_id = u.id OR c.contact_id = u.id)
+            WHERE (c.user_id = ? OR c.contact_id = ?) AND u.id != ?`, 
+            [req.user.id, req.user.id, req.user.id], (err, rows) => {
         if (err) return res.status(500).json({ error: err.message });
         res.json(rows);
     });
 });
 
-// === VIDEO STREAMING (HTTP Range Requests) ===
 
-app.get('/api/stream/:filename', (req, res) => {
-    const filePath = path.join(uploadDir, req.params.filename);
+app.post('/api/contacts/add', authenticate, (req, res) => {
+    const { username } = req.body;
+    db.get('SELECT id FROM users WHERE username = ?', [username], (err, target) => {
+        if (err || !target) return res.status(404).json({ error: 'User not found' });
+        if (target.id === req.user.id) return res.status(400).json({ error: 'Cannot add yourself' });
+        
+        db.run('INSERT INTO contacts (user_id, contact_id, status) VALUES (?, ?, ?)', 
+            [req.user.id, target.id, 'pending'], function(err) {
+            if (err) return res.status(400).json({ error: 'Request already exists' });
+            res.status(201).json({ message: 'Contact request sent' });
+        });
+    });
+});
+
+app.post('/api/contacts/accept', authenticate, (req, res) => {
+    const { contactId } = req.body;
+    db.run('UPDATE contacts SET status = "accepted" WHERE user_id = ? AND contact_id = ?', 
+        [contactId, req.user.id], function(err) {
+        if (err || this.changes === 0) return res.status(404).json({ error: 'Request not found' });
+        res.json({ message: 'Contact request accepted' });
+    });
+});
+
+// === GROUPS API ===
+
+app.post('/api/groups/create', authenticate, (req, res) => {
+    const { name, memberIds } = req.body;
+    db.run('INSERT INTO groups (name, created_by) VALUES (?, ?)', [name, req.user.id], function(err) {
+        if (err) return res.status(500).json({ error: err.message });
+        const groupId = this.lastID;
+        const members = [req.user.id, ...(memberIds || [])];
+        const placeholders = members.map(() => '(?, ?)').join(',');
+        const values = [];
+        members.forEach(id => values.push(groupId, id));
+        
+        db.run(`INSERT INTO group_members (group_id, user_id) VALUES ${placeholders}`, values, (err) => {
+            if (err) return res.status(500).json({ error: err.message });
+            res.status(201).json({ id: groupId, name });
+        });
+    });
+});
+
+app.post('/api/groups/:id/add-member', authenticate, (req, res) => {
+    const { userId } = req.body;
+    const groupId = req.params.id;
+    // Check if user is in group or admin
+    db.get('SELECT * FROM group_members WHERE group_id = ? AND user_id = ?', [groupId, req.user.id], (err, gm) => {
+        if (!gm && req.user.role !== 'admin') return res.status(403).json({ error: 'Unauthorized' });
+        db.run('INSERT INTO group_members (group_id, user_id) VALUES (?, ?)', [groupId, userId], (err) => {
+            if (err) return res.status(400).json({ error: 'Already a member' });
+            res.json({ message: 'Member added' });
+        });
+    });
+});
+
+app.post('/api/user/avatar', authenticate, upload.single('avatar'), (req, res) => {
+    if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+    const url = `/api/media/${req.file.filename}`;
+    db.run('UPDATE users SET avatar_url = ? WHERE id = ?', [url, req.user.id], (err) => {
+        if (err) return res.status(500).json({ error: err.message });
+        res.json({ url });
+    });
+});
+
+
+app.get('/api/groups', authenticate, (req, res) => {
+    db.all(`SELECT g.* FROM groups g JOIN group_members gm ON g.id = gm.group_id WHERE gm.user_id = ?`, 
+        [req.user.id], (err, rows) => {
+        if (err) return res.status(500).json({ error: err.message });
+        res.json(rows);
+    });
+});
+
+app.delete('/api/groups/:id', authenticate, (req, res) => {
+    const groupId = req.params.id;
+    db.get('SELECT created_by FROM groups WHERE id = ?', [groupId], (err, group) => {
+        if (err || !group) return res.status(404).json({ error: 'Group not found' });
+        
+        if (group.created_by !== req.user.id && req.user.role !== 'admin') {
+            return res.status(403).json({ error: 'Unauthorized to delete this group' });
+        }
+
+        db.serialize(() => {
+            db.run('DELETE FROM group_members WHERE group_id = ?', [groupId]);
+            db.run('DELETE FROM messages WHERE receiver_id = ? AND chat_type = "group"', [groupId]);
+            db.run('DELETE FROM groups WHERE id = ?', [groupId], function(err) {
+                if (err) return res.status(500).json({ error: err.message });
+                res.json({ message: 'Group deleted' });
+            });
+        });
+    });
+});
+
+
+// === MEDIA PRIVACY & STREAMING ===
+
+app.get('/api/media/:filename', authenticate, (req, res) => {
+    const { filename } = req.params;
+    const isSticker = filename.includes('sticker') || !filename.includes('-');
+    const filePath = isSticker ? path.join(stickersDir, filename) : path.join(uploadDir, filename);
+    
     if (!fs.existsSync(filePath)) return res.status(404).send('File not found');
 
+    // Security check
+    db.get('SELECT * FROM messages WHERE content LIKE ? AND (sender_id = ? OR receiver_id = ? OR (chat_type="group" AND receiver_id IN (SELECT group_id FROM group_members WHERE user_id = ?)))',
+        [`%${filename}%`, req.user.id, req.user.id, req.user.id], (err, msg) => {
+        
+        let hasAccess = !!msg || req.user.role === 'admin' || isSticker;
+
+        // Also allow if it's the user's own avatar
+        if (!hasAccess) {
+            db.get('SELECT id FROM users WHERE avatar_url LIKE ? AND id = ?', [`%${filename}%`, req.user.id], (err, row) => {
+                if (row) serveFile(req, res, filePath, filename);
+                else res.status(403).json({ error: 'Access denied' });
+            });
+        } else {
+            serveFile(req, res, filePath, filename);
+        }
+    });
+});
+
+function serveFile(req, res, filePath, filename) {
     const stat = fs.statSync(filePath);
-    const fileSize = stat.size;
     const range = req.headers.range;
+    const contentType = filename.endsWith('.mp4') ? 'video/mp4' : 
+                      (filename.endsWith('.png') ? 'image/png' : 
+                      (filename.endsWith('.jpg') || filename.endsWith('.jpeg') ? 'image/jpeg' : 'audio/webm'));
 
     if (range) {
         const parts = range.replace(/bytes=/, '').split('-');
         const start = parseInt(parts[0], 10);
-        const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
-        const chunkSize = (end - start) + 1;
-
-        const file = fs.createReadStream(filePath, { start, end });
+        const end = parts[1] ? parseInt(parts[1], 10) : stat.size - 1;
         res.writeHead(206, {
-            'Content-Range': `bytes ${start}-${end}/${fileSize}`,
+            'Content-Range': `bytes ${start}-${end}/${stat.size}`,
             'Accept-Ranges': 'bytes',
-            'Content-Length': chunkSize,
-            'Content-Type': 'video/mp4',
+            'Content-Length': (end - start) + 1,
+            'Content-Type': contentType,
         });
-        file.pipe(res);
+        fs.createReadStream(filePath, { start, end }).pipe(res);
     } else {
-        res.writeHead(200, {
-            'Content-Length': fileSize,
-            'Content-Type': 'video/mp4',
-        });
+        res.writeHead(200, { 'Content-Length': stat.size, 'Content-Type': contentType });
         fs.createReadStream(filePath).pipe(res);
     }
-});
+}
 
-// === ADMIN API ===
 
-app.get('/api/admin/stats', authenticate, requireAdmin, (req, res) => {
-    const stats = {};
-    db.get('SELECT COUNT(*) as count FROM users', [], (err, row) => {
-        stats.totalUsers = row?.count || 0;
-        db.get('SELECT COUNT(*) as count FROM videos', [], (err, row) => {
-            stats.totalVideos = row?.count || 0;
-            db.get('SELECT COUNT(*) as count FROM likes', [], (err, row) => {
-                stats.totalLikes = row?.count || 0;
-                db.get('SELECT COALESCE(SUM(views), 0) as count FROM videos', [], (err, row) => {
-                    stats.totalViews = row?.count || 0;
-                    res.json(stats);
-                });
-            });
-        });
-    });
-});
+// === MESSAGE API ===
 
-app.get('/api/admin/videos', authenticate, requireAdmin, (req, res) => {
-    db.all(`SELECT v.*, u.username,
-            (SELECT COUNT(*) FROM likes WHERE video_id = v.id) as like_count
-            FROM videos v
-            JOIN users u ON v.user_id = u.id
-            ORDER BY v.created_at DESC`, [], (err, rows) => {
+app.get('/api/messages/:chatType/:id', authenticate, (req, res) => {
+    const { chatType, id } = req.params;
+    let query, params;
+    
+    const baseQuery = `SELECT m.*, u_del.username as deleted_by_username, u_sender.username as sender_username 
+                       FROM messages m 
+                       LEFT JOIN users u_del ON m.deleted_by = u_del.id 
+                       LEFT JOIN users u_sender ON m.sender_id = u_sender.id
+                       WHERE `;
+
+
+    if (chatType === 'direct') {
+        query = `${baseQuery} chat_type = 'direct' AND 
+                 ((sender_id = ? AND receiver_id = ?) OR (sender_id = ? AND receiver_id = ?))
+                 ORDER BY timestamp ASC`;
+        params = [req.user.id, id, id, req.user.id];
+    } else {
+        query = `${baseQuery} chat_type = 'group' AND receiver_id = ?
+                 ORDER BY timestamp ASC`;
+        params = [id];
+    }
+
+    db.all(query, params, (err, rows) => {
         if (err) return res.status(500).json({ error: err.message });
         res.json(rows);
     });
 });
 
-// Get available users for chat
-app.get('/api/chat/users', authenticate, (req, res) => {
-    db.all('SELECT id, username FROM users WHERE id != ?', [req.user.id], (err, rows) => {
+
+app.post('/api/upload', authenticate, upload.single('media'), (req, res) => {
+    if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+    res.json({ url: `/api/media/${req.file.filename}` });
+});
+
+// === STICKERS API ===
+
+app.post('/api/stickers/upload', authenticate, upload.single('sticker'), (req, res) => {
+    if (!req.file) return res.status(400).json({ error: 'No sticker uploaded' });
+    db.run('INSERT INTO stickers (filename, creator_id) VALUES (?, ?)', [req.file.filename, req.user.id], function(err) {
         if (err) return res.status(500).json({ error: err.message });
-        res.json(rows);
+        res.status(201).json({ id: this.lastID, url: `/api/media/${req.file.filename}` });
     });
 });
 
-// Get chat history with a specific user
-app.get('/api/messages/:userId', authenticate, (req, res) => {
-    const { userId } = req.params;
-    db.all(`SELECT * FROM messages 
-            WHERE (sender_id = ? AND receiver_id = ?) 
-               OR (sender_id = ? AND receiver_id = ?) 
-            ORDER BY timestamp ASC`, 
-        [req.user.id, userId, userId, req.user.id], (err, rows) => {
+app.get('/api/stickers', authenticate, (req, res) => {
+    db.all('SELECT * FROM stickers', [], (err, rows) => {
         if (err) return res.status(500).json({ error: err.message });
-        res.json(rows);
-    });
-});
-
-// Admin: Get all messages for monitor
-app.get('/api/messages/all', authenticate, requireAdmin, (req, res) => {
-    db.all(`SELECT m.*, 
-            s.username as sender_username, 
-            r.username as receiver_username 
-            FROM messages m
-            JOIN users s ON m.sender_id = s.id
-            JOIN users r ON m.receiver_id = r.id
-            ORDER BY m.timestamp DESC LIMIT 100`, [], (err, rows) => {
-        if (err) return res.status(500).json({ error: err.message });
-        res.json(rows);
+        res.json(rows.map(s => ({ ...s, url: `/api/media/${s.filename}` })));
     });
 });
 
@@ -356,43 +475,61 @@ io.use((socket, next) => {
 io.on('connection', (socket) => {
     console.log(`User connected: ${socket.user.username}`);
     onlineUsers.set(socket.user.id, socket.id);
-    io.emit('user_status', Array.from(onlineUsers.keys()));
+    
+    // Join logic: each user joins their own ID room for private messages
+    socket.join(`user_${socket.user.id}`);
+
+    // Join group rooms
+    db.all('SELECT group_id FROM group_members WHERE user_id = ?', [socket.user.id], (err, rows) => {
+        if (!err) rows.forEach(r => socket.join(`group_${r.group_id}`));
+    });
 
     socket.on('send_message', (data) => {
-        const { receiverId, content, type } = data;
-        
-        db.run('INSERT INTO messages (sender_id, receiver_id, content, type) VALUES (?, ?, ?, ?)',
-            [socket.user.id, receiverId, content, type || 'text'],
-            function(err) {
-                if (err) return console.error(err.message);
-                
-                const message = {
-                    id: this.lastID,
-                    sender_id: socket.user.id,
-                    receiver_id: receiverId,
-                    content,
-                    type: type || 'text',
-                    timestamp: new Date().toISOString()
-                };
-
-                // Send to receiver if online
-                const receiverSocketId = onlineUsers.get(receiverId);
-                if (receiverSocketId) {
-                    io.to(receiverSocketId).emit('receive_message', message);
-                }
-                
-                // Send back to sender for confirmation
-                socket.emit('receive_message', message);
-            });
+        const { receiverId, content, type, chatType } = data;
+        db.run('INSERT INTO messages (sender_id, receiver_id, content, type, chat_type) VALUES (?, ?, ?, ?, ?)',
+            [socket.user.id, receiverId, content, type, chatType], function(err) {
+            if (err) return;
+            const messageId = this.lastID;
+            const message = { 
+                id: messageId, 
+                sender_id: socket.user.id, 
+                sender_username: socket.user.username,
+                receiver_id: receiverId, 
+                content, 
+                type, 
+                chat_type: chatType, 
+                timestamp: new Date().toISOString() 
+            };
+            
+            const target = chatType === 'direct' ? `user_${receiverId}` : `group_${receiverId}`;
+            io.to(target).emit('receive_message', message);
+            socket.emit('receive_message', message);
+        });
     });
+
+    socket.on('delete_message', (messageId) => {
+        db.get('SELECT * FROM messages WHERE id = ?', [messageId], (err, msg) => {
+            if (msg && (msg.sender_id === socket.user.id || socket.user.role === 'admin')) {
+                db.run('UPDATE messages SET is_deleted = 1, deleted_by = ? WHERE id = ?', [socket.user.id, messageId], () => {
+                    const target = msg.chat_type === 'direct' ? `user_${msg.receiver_id}` : `group_${msg.receiver_id}`;
+                    
+                    // Fetch deleter username
+                    db.get('SELECT username FROM users WHERE id = ?', [socket.user.id], (err, deleter) => {
+                        const payload = { messageId, deletedBy: deleter?.username || 'Sistema' };
+                        io.to(target).emit('message_deleted', payload);
+                        socket.emit('message_deleted', payload);
+                        if (msg.chat_type === 'direct') io.to(`user_${msg.sender_id}`).emit('message_deleted', payload);
+                    });
+                });
+            }
+        });
+    });
+
 
     socket.on('disconnect', () => {
-        console.log(`User disconnected: ${socket.user.username}`);
         onlineUsers.delete(socket.user.id);
-        io.emit('user_status', Array.from(onlineUsers.keys()));
     });
 });
 
-server.listen(PORT, () => {
-    console.log(`jo no xerro server running on port ${PORT}`);
-});
+server.listen(PORT, () => console.log(`Backend running on port ${PORT}`));
+
