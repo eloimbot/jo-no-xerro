@@ -50,8 +50,16 @@ const upload = multer({ storage, limits: { fileSize: MAX_FILE_SIZE } });
 
 const authenticate = (req, res, next) => {
     const auth = req.headers.authorization;
-    if (!auth || !auth.startsWith('Bearer ')) return res.status(401).json({ error: 'Unauthorized' });
-    jwt.verify(auth.slice(7), JWT_SECRET, (err, decoded) => {
+    const customAuth = req.headers['x-auth-token'];
+    
+    let tokenStr = null;
+    if (auth && auth.startsWith('Bearer ')) tokenStr = auth.slice(7);
+    else if (customAuth) tokenStr = customAuth;
+    else if (req.query.token) tokenStr = req.query.token;
+    
+    if (!tokenStr) return res.status(401).json({ error: 'Unauthorized' });
+    
+    jwt.verify(tokenStr, JWT_SECRET, (err, decoded) => {
         if (err) return res.status(401).json({ error: 'Invalid token' });
         req.user = decoded;
         next();
@@ -549,7 +557,10 @@ io.on('connection', (socket) => {
         const { receiverId, content, type, chatType } = data;
         db.run('INSERT INTO messages (sender_id, receiver_id, content, type, chat_type) VALUES (?, ?, ?, ?, ?)',
             [socket.user.id, receiverId, content, type, chatType], function(err) {
-            if (err) return;
+            if (err) {
+                console.error('DATABASE ERROR (send_message):', err.message);
+                return;
+            }
             const messageId = this.lastID;
             const message = { 
                 id: messageId, 

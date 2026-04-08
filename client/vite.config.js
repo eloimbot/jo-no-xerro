@@ -5,13 +5,20 @@ import react from '@vitejs/plugin-react'
 export default defineConfig({
   plugins: [react()],
   server: {
-    allowedHosts: ['jonoxerro.eloihomelab.es'],
+    allowedHosts: true,
     proxy: {
-      '/api': 'http://localhost:3001',
-      '/uploads': 'http://localhost:3001',
+      '/api': {
+        target: 'http://localhost:3001',
+        changeOrigin: true
+      },
+      '/uploads': {
+        target: 'http://localhost:3001',
+        changeOrigin: true
+      },
       '/socket.io': {
         target: 'http://localhost:3001',
-        ws: true
+        ws: true,
+        changeOrigin: true
       }
     }
   }
