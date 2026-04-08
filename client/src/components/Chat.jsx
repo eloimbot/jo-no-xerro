@@ -91,7 +91,7 @@ function Chat() {
 
     socket.emit('send_message', {
       receiverId: selectedChat.id,
-      chat_type: selectedChat.type,
+      chatType: selectedChat.type,
       content: content,
       type: typeOverride
     });
@@ -101,15 +101,24 @@ function Chat() {
 
   const startMediaRecording = async (type) => {
     try {
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        throw new Error("El navegador no soporta grabación o necesita usar HTTPS / localhost.");
+      }
+      
       const constraints = type === 'video' ? { video: true, audio: true } : { audio: true };
       const stream = await navigator.mediaDevices.getUserMedia(constraints);
       const mediaRecorder = new MediaRecorder(stream);
       mediaRecorderRef.current = mediaRecorder;
       chunksRef.current = [];
 
-      mediaRecorder.ondataavailable = (e) => chunksRef.current.push(e.data);
+      mediaRecorder.ondataavailable = (e) => {
+        if (e.data && e.data.size > 0) {
+          chunksRef.current.push(e.data);
+        }
+      };
       
       mediaRecorder.onstop = async () => {
+        if (chunksRef.current.length === 0) return;
         const blob = new Blob(chunksRef.current, { type: type === 'video' ? 'video/mp4' : 'audio/webm' });
         const formData = new FormData();
         formData.append('media', blob, `recording.${type === 'video' ? 'mp4' : 'webm'}`);
@@ -121,6 +130,7 @@ function Chat() {
           handleSendMessage(null, res.data.url, type);
         } catch (err) {
           console.error('Upload failed', err);
+          alert('Error subiendo el archivo: ' + err.message);
         }
         stream.getTracks().forEach(t => t.stop());
       };
@@ -129,7 +139,8 @@ function Chat() {
       if (type === 'video') setIsRecordingVideo(true);
       else setIsRecordingAudio(true);
     } catch (err) {
-      alert("Permiso denegado");
+      console.error("Recording error:", err);
+      alert(`No se pudo usar la grabadora:\n${err.message || err.name}`);
     }
   };
 
@@ -308,8 +319,8 @@ function Chat() {
                       ) : (
                         <>
                           {msg.type === 'text' && <p>{msg.content}</p>}
-                          {msg.type === 'video' && <video src={msg.content} controls className="media-msg" />}
-                          {msg.type === 'audio' && <audio src={msg.content} controls className="audio-msg" />}
+                          {msg.type === 'video' && <video src={`${msg.content}?token=${token}`} controls className="media-msg" />}
+                          {msg.type === 'audio' && <audio src={`${msg.content}?token=${token}`} controls className="audio-msg" />}
                           {msg.type === 'sticker' && <img src={msg.content} className="sticker-img" style={{ maxWidth: 100 }} />}
                         </>
                       )}

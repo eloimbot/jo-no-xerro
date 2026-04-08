@@ -355,28 +355,53 @@ app.delete('/api/groups/:id', authenticate, (req, res) => {
 
 // === MEDIA PRIVACY & STREAMING ===
 
-app.get('/api/media/:filename', authenticate, (req, res) => {
+app.get('/api/media/:filename', (req, res) => {
     const { filename } = req.params;
-    const isSticker = filename.includes('sticker') || !filename.includes('-');
-    const filePath = isSticker ? path.join(stickersDir, filename) : path.join(uploadDir, filename);
-    
-    if (!fs.existsSync(filePath)) return res.status(404).send('File not found');
+    let filePath = path.join(uploadDir, filename);
+    let isSticker = false;
 
-    // Security check
-    db.get('SELECT * FROM messages WHERE content LIKE ? AND (sender_id = ? OR receiver_id = ? OR (chat_type="group" AND receiver_id IN (SELECT group_id FROM group_members WHERE user_id = ?)))',
-        [`%${filename}%`, req.user.id, req.user.id, req.user.id], (err, msg) => {
-        
-        let hasAccess = !!msg || req.user.role === 'admin' || isSticker;
+    if (fs.existsSync(path.join(stickersDir, filename))) {
+        filePath = path.join(stickersDir, filename);
+        isSticker = true;
+    } else if (!fs.existsSync(filePath)) {
+        return res.status(404).send('File not found');
+    }
 
-        // Also allow if it's the user's own avatar
-        if (!hasAccess) {
-            db.get('SELECT id FROM users WHERE avatar_url LIKE ? AND id = ?', [`%${filename}%`, req.user.id], (err, row) => {
-                if (row) serveFile(req, res, filePath, filename);
-                else res.status(403).json({ error: 'Access denied' });
-            });
-        } else {
-            serveFile(req, res, filePath, filename);
+    if (isSticker) {
+        return serveFile(req, res, filePath, filename);
+    }
+
+    // Check if it's a public Feed video
+    db.get('SELECT id FROM videos WHERE filename = ?', [filename], (err, videoRow) => {
+        if (videoRow) {
+            return serveFile(req, res, filePath, filename); // Feed videos are public
         }
+
+        // AUTH REQUIRED for non-public files (Private Messages, Avatars)
+        const auth = req.headers.authorization || (req.query.token ? `Bearer ${req.query.token}` : null);
+        if (!auth || !auth.startsWith('Bearer ')) return res.status(401).json({ error: 'Unauthorized' });
+        
+        jwt.verify(auth.slice(7), JWT_SECRET, (err, decoded) => {
+            if (err) return res.status(401).json({ error: 'Invalid token' });
+            req.user = decoded;
+
+            // Security check for private messages
+            db.get('SELECT * FROM messages WHERE content LIKE ? AND (sender_id = ? OR receiver_id = ? OR (chat_type="group" AND receiver_id IN (SELECT group_id FROM group_members WHERE user_id = ?)))',
+                [`%${filename}%`, req.user.id, req.user.id, req.user.id], (err, msg) => {
+                
+                let hasAccess = !!msg || req.user.role === 'admin';
+
+                // Also allow if it's the user's own avatar
+                if (!hasAccess) {
+                    db.get('SELECT id FROM users WHERE avatar_url LIKE ? AND id = ?', [`%${filename}%`, req.user.id], (err, row) => {
+                        if (row) serveFile(req, res, filePath, filename);
+                        else res.status(403).json({ error: 'Access denied' });
+                    });
+                } else {
+                    serveFile(req, res, filePath, filename);
+                }
+            });
+        });
     });
 });
 
@@ -385,7 +410,10 @@ function serveFile(req, res, filePath, filename) {
     const range = req.headers.range;
     const contentType = filename.endsWith('.mp4') ? 'video/mp4' : 
                       (filename.endsWith('.png') ? 'image/png' : 
-                      (filename.endsWith('.jpg') || filename.endsWith('.jpeg') ? 'image/jpeg' : 'audio/webm'));
+                      (filename.endsWith('.jpg') || filename.endsWith('.jpeg') ? 'image/jpeg' : 
+                      (filename.endsWith('.webp') ? 'image/webp' :
+                      (filename.endsWith('.gif') ? 'image/gif' : 
+                      (filename.endsWith('.svg') ? 'image/svg+xml' : 'audio/webm')))));
 
     if (range) {
         const parts = range.replace(/bytes=/, '').split('-');
@@ -445,16 +473,49 @@ app.post('/api/upload', authenticate, upload.single('media'), (req, res) => {
 
 app.post('/api/stickers/upload', authenticate, upload.single('sticker'), (req, res) => {
     if (!req.file) return res.status(400).json({ error: 'No sticker uploaded' });
-    db.run('INSERT INTO stickers (filename, creator_id) VALUES (?, ?)', [req.file.filename, req.user.id], function(err) {
-        if (err) return res.status(500).json({ error: err.message });
-        res.status(201).json({ id: this.lastID, url: `/api/media/${req.file.filename}` });
+    const url = `/api/media/${req.file.filename}`;
+    db.run('INSERT INTO stickers (url, creator_id) VALUES (?, ?)', [url, req.user.id], function(err) {
+        if (err) {
+            // Un error como SQLITE_ERROR ignorarlo fallaría. Tratemos de ver si tiene columna de url
+            // Si esto falla es que la tabla es distinta.
+            db.run('INSERT INTO stickers (filename, creator_id) VALUES (?, ?)', [req.file.filename, req.user.id], function(fallbackErr) {
+               if (fallbackErr) return res.status(500).json({ error: fallbackErr.message });
+               res.status(201).json({ id: this.lastID, url });
+            });
+            return;
+        }
+        res.status(201).json({ id: this.lastID, url });
     });
 });
 
 app.get('/api/stickers', authenticate, (req, res) => {
-    db.all('SELECT * FROM stickers', [], (err, rows) => {
+    fs.readdir(stickersDir, (err, files) => {
         if (err) return res.status(500).json({ error: err.message });
-        res.json(rows.map(s => ({ ...s, url: `/api/media/${s.filename}` })));
+        
+        const existingFiles = new Set(files);
+        const folderStickers = files
+            .filter(f => f.match(/\.(png|jpg|jpeg|gif|webp|svg)$/i))
+            .map((f, i) => ({
+                id: `local_${i}_${f}`,
+                url: `/api/media/${f}`,
+                name: f
+            }));
+            
+        db.all('SELECT * FROM stickers', [], (err, rows) => {
+            if (err) return res.status(500).json({ error: err.message });
+            
+            const dbStickers = rows.map(s => ({ ...s, url: s.url || `/api/media/${s.filename}` }))
+                .filter(s => {
+                    const match = s.url.match(/^\/api\/media\/(.+)$/);
+                    if (match) return existingFiles.has(match[1]);
+                    return true;
+                });
+                
+            const urlSet = new Set(dbStickers.map(s => s.url));
+            const finalStickers = [...dbStickers, ...folderStickers.filter(s => !urlSet.has(s.url))];
+            
+            res.json(finalStickers);
+        });
     });
 });
 
@@ -501,9 +562,14 @@ io.on('connection', (socket) => {
                 timestamp: new Date().toISOString() 
             };
             
-            const target = chatType === 'direct' ? `user_${receiverId}` : `group_${receiverId}`;
-            io.to(target).emit('receive_message', message);
-            socket.emit('receive_message', message);
+            if (chatType === 'direct') {
+                if (receiverId !== socket.user.id) {
+                    io.to(`user_${receiverId}`).emit('receive_message', message);
+                }
+                io.to(`user_${socket.user.id}`).emit('receive_message', message);
+            } else {
+                io.to(`group_${receiverId}`).emit('receive_message', message);
+            }
         });
     });
 
