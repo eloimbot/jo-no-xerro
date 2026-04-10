@@ -379,13 +379,18 @@ app.get('/api/media/:filename', (req, res) => {
         return serveFile(req, res, filePath, filename);
     }
 
-    // Check if it's a public Feed video
+    // Check if it's a public Feed video or an image
+    const isImage = filename.match(/\.(png|jpg|jpeg|gif|webp|svg)$/i);
+    if (isImage) {
+        return serveFile(req, res, filePath, filename); // Images (avatars/stickers) are public
+    }
+
     db.get('SELECT id FROM videos WHERE filename = ?', [filename], (err, videoRow) => {
         if (videoRow) {
             return serveFile(req, res, filePath, filename); // Feed videos are public
         }
 
-        // AUTH REQUIRED for non-public files (Private Messages, Avatars)
+        // AUTH REQUIRED for non-public files (Private Messages)
         const auth = req.headers.authorization || (req.query.token ? `Bearer ${req.query.token}` : null);
         if (!auth || !auth.startsWith('Bearer ')) return res.status(401).json({ error: 'Unauthorized' });
         
@@ -393,21 +398,18 @@ app.get('/api/media/:filename', (req, res) => {
             if (err) return res.status(401).json({ error: 'Invalid token' });
             req.user = decoded;
 
-            // Security check for private messages
-            db.get('SELECT * FROM messages WHERE content LIKE ? AND (sender_id = ? OR receiver_id = ? OR (chat_type="group" AND receiver_id IN (SELECT group_id FROM group_members WHERE user_id = ?)))',
-                [`%${filename}%`, req.user.id, req.user.id, req.user.id], (err, msg) => {
-                
-                let hasAccess = !!msg || req.user.role === 'admin';
+                // Security check for private messages
+                db.get('SELECT * FROM messages WHERE content LIKE ? AND (sender_id = ? OR receiver_id = ? OR (chat_type="group" AND receiver_id IN (SELECT group_id FROM group_members WHERE user_id = ?)))',
+                    [`%${filename}%`, req.user.id, req.user.id, req.user.id], (err, msg) => {
+                    
+                    let hasAccess = !!msg || req.user.role === 'admin';
 
-                // Also allow if it's the user's own avatar
-                if (!hasAccess) {
-                    db.get('SELECT id FROM users WHERE avatar_url LIKE ? AND id = ?', [`%${filename}%`, req.user.id], (err, row) => {
-                        if (row) serveFile(req, res, filePath, filename);
-                        else res.status(403).json({ error: 'Access denied' });
-                    });
-                } else {
-                    serveFile(req, res, filePath, filename);
-                }
+                    if (!hasAccess) {
+                        res.status(403).json({ error: 'Access denied' });
+                    } else {
+                        serveFile(req, res, filePath, filename);
+                    }
+                });
             });
         });
     });
