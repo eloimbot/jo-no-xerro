@@ -411,7 +411,6 @@ app.get('/api/media/:filename', (req, res) => {
                     }
                 });
             });
-        });
     });
 });
 
